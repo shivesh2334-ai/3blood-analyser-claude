@@ -387,7 +387,7 @@ def pdf_to_image_bytes(pdf_bytes):
 def extract_cbc_with_gemini(api_key, img_bytes, mime_type):
     import google.generativeai as genai
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-2.0-flash")
     prompt = """Extract CBC values from this lab report image. Return ONLY valid JSON with these keys
 (use null for missing values, numeric values only, no units):
 {"rbc":null,"hgb":null,"hct":null,"mcv":null,"mch":null,"mchc":null,"rdw":null,
