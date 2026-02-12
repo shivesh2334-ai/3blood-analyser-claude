@@ -1,18 +1,30 @@
-streamlit
-anthropic
-sentence-transformers
-transformers
-pillow
-PyMuPD
-numpy
-scipy
-torch
-pandas
-nltk
-accelerate
+# Core dependencies for CBC RAG Analyzer
+streamlit>=1.28.0
+anthropic>=0.7.0
 
+# Sentence transformers for local embeddings (fixes the error)
+sentence-transformers>=2.2.2
+transformers>=4.30.0
 
+# Image processing
+pillow>=10.0.0
 
+# PDF processing - FIXED TYPO: Was "PyMuPD" should be "PyMuPDF"
+PyMuPDF>=1.23.0
+
+# Scientific computing and vector operations
+numpy>=1.24.0
+scipy>=1.10.0
+torch>=2.0.0
+
+# Data handling
+pandas>=2.0.0
+
+# Natural language processing
+nltk>=3.8.0
+
+# Performance optimization
+accelerate>=0.20.0
 
 
 
