@@ -2,8 +2,8 @@ streamlit
 anthropic
 sentence-transformers
 transformers
-#Pillow
-#PyMuPD
+#illow
+PyMuPD
 numpy
 scipy
 torch
