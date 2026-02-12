@@ -1,9 +1,10 @@
 """
 CBC RAG Engine — Retrieval-Augmented Generation for Clinical CBC Analysis
-Embeds UpToDate knowledge chunks using Google Gemini Embeddings,
-performs cosine similarity retrieval, and augments Gemini generation.
 
-Updated: gemini-2.0-flash (replaces deprecated gemini-1.5-flash)
+Architecture (Claude edition):
+  Embeddings : sentence-transformers/all-MiniLM-L6-v2  (local, no API key)
+  Generation : Anthropic Claude API  (claude-3-5-haiku-20241022)
+  Retrieval  : Cosine similarity (pure Python)
 """
 
 import json
@@ -39,39 +40,34 @@ def load_knowledge_base(kb_path: str) -> list:
 
 
 # ─────────────────────────────────────────────────────────
-# GEMINI EMBEDDING CLIENT
+# LOCAL SENTENCE-TRANSFORMER EMBEDDER  (no API key needed)
 # ─────────────────────────────────────────────────────────
 
-class GeminiEmbeddingClient:
-    """Wraps Gemini Embedding API — text-embedding-004."""
+class SentenceTransformerEmbedder:
+    """
+    Local semantic embedder using sentence-transformers.
+    Model: all-MiniLM-L6-v2 (~90 MB, downloaded once, then cached).
+    No API key required — runs entirely on device.
+    """
 
-    def __init__(self, api_key: str, model: str = "models/text-embedding-004"):
-        import google.generativeai as genai
-        genai.configure(api_key=api_key)
-        self.genai = genai
-        self.model = model
+    MODEL_NAME = "all-MiniLM-L6-v2"
 
-    def embed(self, text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list:
+    def __init__(self, model_name: str = MODEL_NAME):
+        from sentence_transformers import SentenceTransformer
+        self._model = SentenceTransformer(model_name)
+
+    def embed(self, text: str, **kwargs) -> list:
         """Embed a single text string; returns list of floats."""
-        result = self.genai.embed_content(
-            model=self.model,
-            content=text,
-            task_type=task_type,
-        )
-        return result["embedding"]
+        return self._model.encode(text, convert_to_numpy=True).tolist()
 
     def embed_query(self, text: str) -> list:
-        """Embed a query string (RETRIEVAL_QUERY task type)."""
-        return self.embed(text, task_type="RETRIEVAL_QUERY")
+        """Embed a search query (same as embed for MiniLM)."""
+        return self.embed(text)
 
-    def embed_batch(self, texts: list, task_type: str = "RETRIEVAL_DOCUMENT",
-                    delay: float = 0.1) -> list:
-        """Embed a list of texts with rate-limit delay."""
-        embeddings = []
-        for text in texts:
-            embeddings.append(self.embed(text, task_type=task_type))
-            time.sleep(delay)
-        return embeddings
+    def embed_batch(self, texts: list, **kwargs) -> list:
+        """Embed a list of texts; returns list of float lists."""
+        vecs = self._model.encode(texts, convert_to_numpy=True, show_progress_bar=False)
+        return [v.tolist() for v in vecs]
 
 
 # ─────────────────────────────────────────────────────────
@@ -91,14 +87,13 @@ class InMemoryVectorStore:
 
     def search(self, query_embedding: list, top_k: int = 5,
                section_filter: Optional[str] = None) -> list:
-        """Return top_k chunks by cosine similarity, with optional section filter."""
+        """Return top_k chunks ranked by cosine similarity."""
         scored = []
         for idx, emb in enumerate(self.embeddings):
             doc = self.documents[idx]
             if section_filter and doc.get("section") != section_filter:
                 continue
-            score = cosine_similarity(query_embedding, emb)
-            scored.append((score, idx))
+            scored.append((cosine_similarity(query_embedding, emb), idx))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         results = []
@@ -121,45 +116,49 @@ class CBCRagEngine:
     Main RAG engine for CBC clinical analysis.
 
     Workflow:
-      1. Load knowledge base chunks (JSON)
-      2. Build embeddings once per session (cached in Streamlit session_state)
-      3. For each clinical query: embed query → retrieve chunks → generate answer
+      1. Build index (local sentence-transformers embeddings — no API key)
+      2. For each clinical query: embed query → cosine search → augment prompt → Claude generates
     """
 
-    def __init__(self, api_key: str, kb_path: str,
-                 embed_model: str = "models/text-embedding-004",
-                 gen_model: str = "gemini-2.0-flash"):
-        import google.generativeai as genai
-        genai.configure(api_key=api_key)
-        self.genai     = genai
-        self.gen_model = gen_model
-        self.embedder  = GeminiEmbeddingClient(api_key=api_key, model=embed_model)
-        self.store     = InMemoryVectorStore()
-        self.chunks    = load_knowledge_base(kb_path)
-        self._ready    = False
+    DEFAULT_GEN_MODEL = "claude-3-5-haiku-20241022"
 
-    # ── INDEX BUILDING ────────────────────────────────────
+    def __init__(self, kb_path: str,
+                 api_key: Optional[str] = None,
+                 gen_model: str = DEFAULT_GEN_MODEL):
+        self.kb_path    = kb_path
+        self.api_key    = api_key
+        self.gen_model  = gen_model
+        self.embedder   = SentenceTransformerEmbedder()
+        self.store      = InMemoryVectorStore()
+        self.chunks     = load_knowledge_base(kb_path)
+        self._ready     = False
+
+    # ── INDEX BUILDING  (local, no API key) ──────────────
 
     def build_index(self, progress_callback=None) -> int:
         """
-        Embed all chunks and load into the vector store.
-        progress_callback(i, total) is called after each chunk.
+        Embed all chunks with local sentence-transformers.
+        progress_callback(i, total) called after each chunk.
         Returns number of chunks indexed.
         """
         total = len(self.chunks)
-        for i, chunk in enumerate(self.chunks):
-            # Rich embedding: section + title + keywords + body text
-            text_to_embed = (
+
+        # Batch embed for efficiency
+        texts = []
+        for chunk in self.chunks:
+            texts.append(
                 f"Section: {chunk.get('section', '')}\n"
                 f"Title: {chunk.get('title', '')}\n"
                 f"Keywords: {', '.join(chunk.get('keywords', []))}\n"
                 f"{chunk['text']}"
             )
-            embedding = self.embedder.embed(text_to_embed, task_type="RETRIEVAL_DOCUMENT")
-            self.store.add(chunk, embedding)
+
+        embeddings = self.embedder.embed_batch(texts)
+
+        for i, (chunk, emb) in enumerate(zip(self.chunks, embeddings)):
+            self.store.add(chunk, emb)
             if progress_callback:
                 progress_callback(i + 1, total)
-            time.sleep(0.05)   # gentle rate-limit
 
         self._ready = True
         return total
@@ -171,14 +170,14 @@ class CBCRagEngine:
 
     def retrieve(self, query: str, top_k: int = 4,
                  section_filter: Optional[str] = None) -> list:
-        """Retrieve top_k most relevant knowledge chunks for a query."""
+        """Retrieve top_k most relevant chunks for a query."""
         if not self._ready:
             raise RuntimeError("Index not built. Call build_index() first.")
         q_emb = self.embedder.embed_query(query)
         return self.store.search(q_emb, top_k=top_k, section_filter=section_filter)
 
     def format_context(self, chunks: list) -> str:
-        """Format retrieved chunks as a context block for the generation prompt."""
+        """Format retrieved chunks as a context block for the prompt."""
         parts = []
         for i, chunk in enumerate(chunks, 1):
             parts.append(
@@ -187,22 +186,27 @@ class CBCRagEngine:
             )
         return "\n\n".join(parts)
 
-    # ── GENERATE WITH RAG ─────────────────────────────────
+    # ── GENERATE WITH RAG  (Claude API) ──────────────────
 
     def generate_with_rag(self, query: str, top_k: int = 4,
                           additional_context: str = "",
                           temperature: float = 0.2) -> dict:
         """
-        Full RAG pipeline: retrieve → augment prompt → generate answer.
+        Full RAG pipeline: retrieve → augment prompt → Claude generates.
         Returns dict: {answer, sources, retrieved_chunks, query}
         """
-        # 1. Retrieve
+        if not self.api_key:
+            raise ValueError("Anthropic API key required for generation.")
+
+        import anthropic
+
+        # 1. Retrieve relevant chunks
         retrieved   = self.retrieve(query, top_k=top_k)
         context_str = self.format_context(retrieved)
 
         # 2. Build augmented prompt
         extra = (
-            f"ADDITIONAL PATIENT CONTEXT:\n{additional_context}\n"
+            f"ADDITIONAL PATIENT CONTEXT:\n{additional_context}\n\n"
             if additional_context else ""
         )
         prompt = f"""You are an expert clinical hematologist with deep knowledge of CBC \
@@ -217,8 +221,7 @@ RETRIEVED KNOWLEDGE PASSAGES:
 {context_str}
 ────────────────────────────────────────
 
-{extra}
-CLINICAL QUESTION:
+{extra}CLINICAL QUESTION:
 {query}
 
 ────────────────────────────────────────
@@ -230,13 +233,15 @@ INSTRUCTIONS:
 - End with a "Key References Used" list
 """
 
-        # 3. Generate using gemini-2.0-flash
-        model = self.genai.GenerativeModel(
-            self.gen_model,
-            generation_config={"temperature": temperature, "max_output_tokens": 1500}
+        # 3. Generate with Claude
+        client  = anthropic.Anthropic(api_key=self.api_key)
+        message = client.messages.create(
+            model=self.gen_model,
+            max_tokens=1500,
+            temperature=temperature,
+            messages=[{"role": "user", "content": prompt}]
         )
-        response = model.generate_content(prompt)
-        answer   = response.text
+        answer = message.content[0].text
 
         # 4. Build source attribution list
         sources = [
@@ -245,7 +250,7 @@ INSTRUCTIONS:
                 "title":   c.get("title", ""),
                 "section": c.get("section", ""),
                 "score":   c.get("_score", 0),
-                "preview": c["text"][:120] + "..."
+                "preview": c["text"][:120] + "…"
             }
             for i, c in enumerate(retrieved)
         ]
@@ -260,10 +265,10 @@ INSTRUCTIONS:
     # ── TARGETED ANALYSIS METHODS ─────────────────────────
 
     def analyze_anemia(self, cbc_values: dict, sex: str) -> Optional[dict]:
-        hgb   = cbc_values.get("hgb")
-        mcv   = cbc_values.get("mcv")
-        rdw   = cbc_values.get("rdw")
-        retic = cbc_values.get("retic")
+        hgb    = cbc_values.get("hgb")
+        mcv    = cbc_values.get("mcv")
+        rdw    = cbc_values.get("rdw")
+        retic  = cbc_values.get("retic")
         hgb_lo = 13.5 if sex == "M" else 12.0
 
         if hgb is None or hgb >= hgb_lo:
@@ -272,22 +277,20 @@ INSTRUCTIONS:
         query = (
             f"Patient: {sex}, Hgb={hgb} g/dL, MCV={mcv} fL, RDW={rdw}%, "
             f"Reticulocytes={retic}%.\n"
-            "Classify the type of anemia (microcytic/normocytic/macrocytic), identify the "
-            "most likely causes, explain the pathophysiology, and recommend specific next "
-            "investigations. What does the RDW tell us? What is the reticulocyte production "
-            "index indicating?"
+            "Classify the anemia (microcytic/normocytic/macrocytic), identify the most likely "
+            "causes, explain pathophysiology, and recommend specific next investigations. "
+            "What does the RDW indicate? What is the reticulocyte production index?"
         )
         return self.generate_with_rag(
-            query=query,
-            top_k=5,
-            additional_context=f"CBC values: {json.dumps({k:v for k,v in cbc_values.items() if v})}",
+            query=query, top_k=5,
+            additional_context=f"CBC: {json.dumps({k:v for k,v in cbc_values.items() if v})}",
         )
 
     def analyze_neutrophil_abnormality(self, cbc_values: dict) -> Optional[dict]:
-        wbc       = cbc_values.get("wbc")
-        neut_abs  = cbc_values.get("neut_abs")
-        neut_pct  = cbc_values.get("neut_pct")
-        bands     = cbc_values.get("bands")
+        wbc      = cbc_values.get("wbc")
+        neut_abs = cbc_values.get("neut_abs")
+        neut_pct = cbc_values.get("neut_pct")
+        bands    = cbc_values.get("bands")
 
         anc = neut_abs
         if anc is None and wbc and neut_pct:
@@ -297,28 +300,25 @@ INSTRUCTIONS:
             return None
 
         if anc > 7.7:
-            condition = "neutrophilia"
             query = (
                 f"WBC={wbc} ×10⁹/L, ANC={anc:.2f} ×10⁹/L, Bands={bands}%.\n"
-                "Evaluate this neutrophilia. Classify severity, enumerate the most likely "
-                "causes in order, differentiate reactive from neoplastic causes, indicate "
-                "red flags for CML or other MPNs, and provide specific workup steps."
+                "Evaluate neutrophilia: classify severity, enumerate causes in order, "
+                "differentiate reactive from neoplastic, flag CML/MPN red flags, "
+                "and provide specific workup."
             )
         elif anc < 1.8:
-            condition = "neutropenia"
             query = (
                 f"WBC={wbc} ×10⁹/L, ANC={anc:.2f} ×10⁹/L.\n"
-                "Evaluate this neutropenia. Classify severity and infection risk, list common "
-                "causes by category (drugs, autoimmune, congenital, infectious, marrow failure), "
-                "and provide a stepwise evaluation approach."
+                "Evaluate neutropenia: classify severity and infection risk, list common causes "
+                "by category (drugs, autoimmune, congenital, infectious, marrow failure), "
+                "stepwise evaluation approach."
             )
         else:
             return None
 
         return self.generate_with_rag(
-            query=query,
-            top_k=4,
-            additional_context=f"Condition: {condition}. CBC: {json.dumps({k:v for k,v in cbc_values.items() if v})}",
+            query=query, top_k=4,
+            additional_context=f"CBC: {json.dumps({k:v for k,v in cbc_values.items() if v})}",
         )
 
     def analyze_platelet_abnormality(self, cbc_values: dict) -> Optional[dict]:
@@ -331,24 +331,20 @@ INSTRUCTIONS:
         if plt < 150:
             query = (
                 f"Platelet count={plt} ×10⁹/L, MPV={mpv} fL.\n"
-                "Evaluate this thrombocytopenia. Address pseudothrombocytopenia first. "
-                "Classify severity. Use MPV to guide differential diagnosis. "
-                "List the most common causes and their distinguishing features. "
-                "What urgent steps are needed if platelets are critically low?"
+                "Evaluate thrombocytopenia: rule out pseudothrombocytopenia, classify severity, "
+                "use MPV to guide DDx, list common causes, urgent steps if critically low."
             )
         elif plt > 400:
             query = (
                 f"Platelet count={plt} ×10⁹/L.\n"
-                "Evaluate this thrombocytosis. Distinguish reactive from clonal causes. "
-                "At what threshold should primary thrombocytosis be suspected? "
-                "What mutations should be tested and when?"
+                "Evaluate thrombocytosis: distinguish reactive from clonal, threshold for "
+                "suspecting primary thrombocytosis, which mutations to test and when."
             )
         else:
             return None
 
         return self.generate_with_rag(
-            query=query,
-            top_k=4,
+            query=query, top_k=4,
             additional_context=f"CBC: {json.dumps({k:v for k,v in cbc_values.items() if v})}",
         )
 
@@ -365,27 +361,25 @@ INSTRUCTIONS:
             alc = wbc * lymph_pct / 100
 
         query = (
-            f"Patient: {sex}, age {age} years. ALC={alc} ×10⁹/L, ANC={neut_abs} ×10⁹/L, "
-            f"Platelets={plt} ×10⁹/L, MPV={mpv} fL.\n"
-            "Screen this CBC for primary immunodeficiency disorders (PID). "
-            "What patterns in the CBC suggest specific PIDs? "
-            "For this patient, what are the red flags and which conditions should be ruled out first? "
-            "Describe the stepwise evaluation including flow cytometry and immunoglobulin testing."
+            f"Patient: {sex}, age {age}. ALC={alc} ×10⁹/L, ANC={neut_abs} ×10⁹/L, "
+            f"PLT={plt} ×10⁹/L, MPV={mpv} fL.\n"
+            "Screen CBC for primary immunodeficiency disorders. What patterns suggest specific PIDs? "
+            "Red flags for this patient? Which conditions to rule out first? "
+            "Stepwise evaluation including flow cytometry and immunoglobulin testing."
         )
         return self.generate_with_rag(
-            query=query,
-            top_k=4,
-            additional_context=f"Patient sex: {sex}, age: {age}. CBC: {json.dumps({k:v for k,v in cbc_values.items() if v})}",
+            query=query, top_k=4,
+            additional_context=f"Sex:{sex}, age:{age}. CBC: {json.dumps({k:v for k,v in cbc_values.items() if v})}",
         )
 
     def full_rag_analysis(self, cbc_values: dict, sex: str, age: int) -> dict:
-        """Comprehensive RAG-based clinical narrative covering all abnormal findings."""
+        """Comprehensive RAG-based clinical narrative for all abnormalities."""
         entered = {k: v for k, v in cbc_values.items() if v is not None and v > 0}
 
         hgb_lo = 13.5 if sex == "M" else 12.0
         hgb_hi = 17.5 if sex == "M" else 15.5
-
         abnormals = []
+
         hgb = cbc_values.get("hgb")
         if hgb:
             if hgb < hgb_lo: abnormals.append(f"Anemia (Hgb {hgb} g/dL)")
@@ -393,8 +387,8 @@ INSTRUCTIONS:
 
         wbc = cbc_values.get("wbc")
         if wbc:
-            if wbc > 11.0: abnormals.append(f"Leukocytosis (WBC {wbc} ×10⁹/L)")
-            if wbc < 4.5:  abnormals.append(f"Leukopenia (WBC {wbc} ×10⁹/L)")
+            if wbc > 11.0: abnormals.append(f"Leukocytosis (WBC {wbc})")
+            if wbc < 4.5:  abnormals.append(f"Leukopenia (WBC {wbc})")
 
         neut = cbc_values.get("neut_abs")
         if neut:
@@ -420,21 +414,20 @@ INSTRUCTIONS:
         abn_str  = "; ".join(abnormals) if abnormals else "None identified"
 
         query = (
-            f"Complete CBC analysis for a {age}-year-old {sex_word} patient.\n"
-            f"Identified abnormalities: {abn_str}.\n"
+            f"Complete CBC analysis for a {age}-year-old {sex_word}.\n"
+            f"Abnormalities: {abn_str}.\n"
             f"CBC values: {json.dumps(entered, indent=2)}.\n\n"
             "Provide a comprehensive clinical analysis:\n"
-            "1. PRIORITIZED FINDINGS: Rank abnormalities by clinical urgency\n"
-            "2. UNIFIED DIFFERENTIAL: What single diagnosis or combination best explains all findings?\n"
-            "3. PATHOPHYSIOLOGY: Link the CBC pattern to underlying mechanisms\n"
-            "4. CRITICAL ALERTS: Any values requiring immediate action?\n"
-            "5. SEQUENTIAL INVESTIGATION PLAN: Step-by-step with rationale\n"
-            "6. COLLECTION QUALITY: Any CBC internal inconsistencies suggesting pre-analytical error?"
+            "1. PRIORITIZED FINDINGS: rank by clinical urgency\n"
+            "2. UNIFIED DIFFERENTIAL: best single/combined diagnosis\n"
+            "3. PATHOPHYSIOLOGY: link CBC pattern to mechanisms\n"
+            "4. CRITICAL ALERTS: values requiring immediate action\n"
+            "5. SEQUENTIAL INVESTIGATION PLAN: step-by-step with rationale\n"
+            "6. COLLECTION QUALITY: any internal inconsistencies suggesting pre-analytical error"
         )
         return self.generate_with_rag(
-            query=query,
-            top_k=6,
-            additional_context=f"Patient: {sex}, age {age}. Abnormalities: {abnormals}",
+            query=query, top_k=6,
+            additional_context=f"Sex:{sex}, age:{age}. Abnormalities: {abnormals}",
         )
 
 
@@ -445,7 +438,7 @@ INSTRUCTIONS:
 class KeywordRetriever:
     """
     TF-IDF-style keyword overlap retriever.
-    Used as a fallback when no Gemini API key is available.
+    Used when knowledge index is not yet built.
     """
 
     def __init__(self, chunks: list):
@@ -480,12 +473,12 @@ class KeywordRetriever:
 # FACTORY HELPERS
 # ─────────────────────────────────────────────────────────
 
-def create_rag_engine(api_key: str, kb_path: str) -> CBCRagEngine:
+def create_rag_engine(kb_path: str, api_key: Optional[str] = None) -> CBCRagEngine:
     """Create and return a configured CBCRagEngine."""
-    return CBCRagEngine(api_key=api_key, kb_path=kb_path)
+    return CBCRagEngine(kb_path=kb_path, api_key=api_key)
 
 
 def create_keyword_retriever(kb_path: str) -> KeywordRetriever:
-    """Create and return a keyword-based fallback retriever."""
+    """Create keyword-based fallback retriever."""
     chunks = load_knowledge_base(kb_path)
     return KeywordRetriever(chunks)
