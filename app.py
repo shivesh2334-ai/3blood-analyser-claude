@@ -442,15 +442,28 @@ def extract_cbc_with_claude(api_key: str, img_bytes: bytes, mime_type: str) -> d
     client     = anthropic.Anthropic(api_key=api_key)
     image_data = base64.standard_b64encode(img_bytes).decode("utf-8")
 
-    prompt = (
-        "Extract CBC values from this lab report image. "
-        "Return ONLY valid JSON with these keys "
-        "(use null for missing values, numeric values only, no units):\n"
-        '{"rbc":null,"hgb":null,"hct":null,"mcv":null,"mch":null,"mchc":null,"rdw":null,'
-        '"retic":null,"wbc":null,"neut_abs":null,"neut_pct":null,"lymph_abs":null,"lymph_pct":null,'
-        '"mono_abs":null,"mono_pct":null,"eos_abs":null,"eos_pct":null,"baso_abs":null,"baso_pct":null,'
-        '"bands":null,"plt":null,"mpv":null,"immature_gran":null,"nrbc":null}'
-    )
+    prompt = """Extract all NUMERIC CBC values from this lab report image.
+
+CRITICAL INSTRUCTIONS:
+- Look for the main CBC results table with numeric values (usually in the first page)
+- Extract ONLY numbers - strip all units (g/dL, ×10⁹/L, %, fL, etc.)
+- If a value is not found or is qualitative text (e.g. "Normal", "Adequate"), use null
+- Ignore peripheral smear interpretations and qualitative comments
+- Common parameter names: Hemoglobin/Hb/Hgb, RBC/Red Cell Count, WBC/White Cell Count, 
+  Platelets/PLT, MCV, MCH, MCHC, Neutrophils/Neut, Lymphocytes/Lymph, etc.
+
+Return ONLY valid JSON (no markdown, no explanation):
+{"rbc":null,"hgb":null,"hct":null,"mcv":null,"mch":null,"mchc":null,"rdw":null,
+"retic":null,"wbc":null,"neut_abs":null,"neut_pct":null,"lymph_abs":null,"lymph_pct":null,
+"mono_abs":null,"mono_pct":null,"eos_abs":null,"eos_pct":null,"baso_abs":null,"baso_pct":null,
+"bands":null,"plt":null,"mpv":null,"immature_gran":null,"nrbc":null}
+
+EXAMPLES:
+Report shows "Hemoglobin: 12.5 g/dL" → "hgb":12.5
+Report shows "WBC: 8.2 ×10⁹/L" → "wbc":8.2
+Report shows "Neutrophils: 65%" → "neut_pct":65
+Report shows "Platelets: Adequate" → "plt":null
+"""
 
     message = client.messages.create(
         model="claude-3-5-haiku-20241022",
@@ -679,12 +692,22 @@ def main():
                                      use_container_width=True)
                             extracted = extract_cbc_with_claude(api_key, img_bytes, mime)
                             if extracted:
-                                for k, v in extracted.items():
-                                    if v is not None and k in data:
-                                        data[k] = float(v)
                                 n = sum(1 for v in extracted.values() if v is not None)
-                                st.success(f"✅ Claude extracted {n} parameters")
-                                st.json({k: v for k, v in extracted.items() if v is not None})
+                                if n == 0:
+                                    st.warning(
+                                        "⚠️ No numeric CBC values found. This may be:\n"
+                                        "• A peripheral smear interpretation page (qualitative only)\n"
+                                        "• A page without the main CBC results table\n"
+                                        "• An unsupported report format\n\n"
+                                        "**Try uploading the page with numeric values** "
+                                        "(Hemoglobin, WBC count, Platelet count, etc.)"
+                                    )
+                                else:
+                                    for k, v in extracted.items():
+                                        if v is not None and k in data:
+                                            data[k] = float(v)
+                                    st.success(f"✅ Claude extracted {n} parameters")
+                                    st.json({k: v for k, v in extracted.items() if v is not None})
                     except Exception as e:
                         st.error(f"Extraction error: {e}")
 
