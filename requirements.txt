@@ -2,24 +2,20 @@ streamlit
 anthropic
 sentence-transformers
 transformers
-Pillow
-PyMuPD
-
-
-
-# Vector similarity and embeddings
+#Pillow
+#PyMuPD
 numpy
 scipy
 torch
-
-# Text processing
-nltk
-
-# Data handling
 pandas
-
-# Optional: For better performance
+nltk
 accelerate
+
+
+
+
+
+
 
 
 
