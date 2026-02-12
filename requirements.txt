@@ -1,7 +1,8 @@
-streamlit
-google-generativeai
-Pillow
-PyMuPDF
-pandas
+streamlit>=1.32.0
+google-generativeai>=0.7.0
+Pillow>=10.0.0
+PyMuPDF>=1.23.0
+pandas>=2.0.0
+
 
 
